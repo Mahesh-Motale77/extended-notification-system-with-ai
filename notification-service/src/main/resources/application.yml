@@ -1,0 +1,8 @@
+spring:
+  application:
+    name: notification-service
+  profiles:
+    active: dev
+
+Server:
+  port: 8083
