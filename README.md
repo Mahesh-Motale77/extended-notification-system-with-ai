@@ -1,628 +1,431 @@
-# Notification System
+# AI-Powered Autonomous Notification Recovery Platform
 
-Event-driven notification system built with Java 21, Spring Boot 3.x, Apache Kafka, Redis, and MySQL.
-Supports Email notifications with retry mechanism, Dead Letter Queue (DLQ), user preference management, and order status management.
+> An AI-powered extension to an event-driven notification platform — adding autonomous failure analysis, intelligent recovery decision-making, and automated notification recovery using AI agents, built with **Spring AI (Google Gemini)** on top of **Java 21**, **Spring Boot 3.5**, **Apache Kafka**, **Redis**, and **MySQL**.
 
----
+![Java](https://img.shields.io/badge/Java-21-orange)
+![Spring Boot](https://img.shields.io/badge/Spring%20Boot-3.5-brightgreen)
+![Kafka](https://img.shields.io/badge/Apache%20Kafka-Event%20Driven-black)
+![Spring AI](https://img.shields.io/badge/Spring%20AI-Gemini-blue)
+![Redis](https://img.shields.io/badge/Redis-Idempotency-red)
+![MySQL](https://img.shields.io/badge/MySQL-Persistence-blue)
+![License](https://img.shields.io/badge/License-MIT-lightgrey)
 
-## Architecture
 
-```
-┌──────────────────────────────────┐
-│         Order Service            │
-│         (Port: 8082)             │
-│                                  │
-│  POST /order/v1/create           │
-│         ↓                        │
-│  Saves to orders table           │
-│         ↓                        │
-│  Publishes to Kafka              │
-│  Topic: order-event-topic        │
-└──────────────┬───────────────────┘
-               │
-               ▼ Kafka
-┌──────────────────────────────────────────────────────────┐
-│                  Notification Service                    │
-│                  (Port: 8083)                            │
-│                                                          │
-│  OrderEventNotificationConsumer                          │
-│         ↓                                                │
-│  IdempotencyService (Redis)                              │
-│  Key: idempotency:{orderId}:{orderStatus} TTL: 24hrs     │
-│         ↓                                                │
-│  NotificationServiceImpl                                 │
-│         ↓                                                │
-│  Fetch NotificationPreferences from DB                   │
-│         ↓                                                │
-│  TemplateServiceImpl → build subject + body              │
-│         ↓                                                │
-│  EmailDispatcher → Gmail SMTP                            │
-│         ↓                                                │
-│  Save to notification_details table                      │
-│         ↓                                                │
-│  On Failure → RetryServiceImpl                           │
-│  Retry 1 (2s) → Retry 2 (4s) → Retry 3 (8s)            │
-│         ↓ All retries exhausted                          │
-│  Push to notification-dlq topic                          │
-│         ↓                                                │
-│  DLQConsumer → saves DLQ status to DB                    │
-└──────────────────────────────────────────────────────────┘
-               │
-               ▼
-┌──────────────────────────────────────────────────────────┐
-│           Notification Management API                    │
-│           (Port: 8084)                                   │
-│                                                          │
-│  GET  /dlq/api/v1/records          → View DLQ records    │
-│  POST /dlq/api/v1/retry/{orderId}  → Retry failed notif  │
-│  POST /preferences/api/v1/add      → Add preference      │
-│  GET  /preferences/api/v1/get/{userId} → Get preferences │
-│  POST /template/api/v1/register    → Register template   │
-│  POST /template/api/v1/get         → Get template        │
-│  POST /order/api/v1/status         → Change order status │
-└──────────────────────────────────────────────────────────┘
-               │
-               ▼
-┌──────────────────────────────────┐
-│             MySQL                │
-│  notification_db                 │
-│  ├── orders                      │
-│  ├── notification_details        │
-│  ├── notification_preferences    │
-│  └── notification_template       │
-└──────────────────────────────────┘
-```
+## Project Overview
+
+This repository extends an existing, already-documented **Notification Platform** (Order Service → Kafka → Notification Service → email delivery, with retries and a DLQ) with a new layer of **autonomy**: when a notification exhausts its retries and lands in the dead-letter queue, the system no longer just sits there waiting for a human. It hands the failure to Gemini for root-cause analysis, asks a second AI agent to decide on a recovery strategy, and executes that strategy through a pluggable tool framework — with no human in the loop for the common cases.
+
+This README focuses on that extension: the AI agents, the recovery pipeline, and the tool-based execution engine built around them.
 
 ---
 
-## Tech Stack
+## Base Notification System (Summary)
 
-| Technology | Version | Purpose |
-|---|---|---|
-| Java | 21 | Programming language |
-| Spring Boot | 3.5.x | Backend framework |
-| Apache Kafka | 3.x | Async event streaming |
-| Redis | 7.x | Idempotency check |
-| MySQL | 8.0 | Persistent storage |
-| JavaMail | - | Email via Gmail SMTP |
-| Lombok | - | Boilerplate reduction |
-| Maven Multi-Module | - | Project structure |
+The underlying platform this project builds on is a standard event-driven notification pipeline, already covered in its own documentation:
+
+- **Order Service** (`:8082`) — creates orders, persists them, publishes events to `order-event-topic`.
+- **Notification Service** (`:8083`) — consumes order events, applies a Redis idempotency check, looks up preferences, renders a template, and dispatches email. Failed sends retry with backoff (2s / 4s / 8s) before being pushed to `notification-dlq`.
+- **Notification Management API** (`:8084`) — manages templates and preferences, and exposes DLQ visibility and manual retry.
+
+That base flow is treated here as a given. Everything below is what happens **after** a notification reaches the DLQ.
 
 ---
 
-## Project Structure
+## What This Extension Adds
+
+- AI-driven **failure analysis** (root cause, severity, confidence) for every DLQ event
+- AI-driven **recovery decisions** (retry now, retry later, escalate, manual review, discard)
+- A **Recovery Scheduler** that executes due decisions every minute
+- A **Recovery Agent** that contains no business logic and simply delegates to tools
+- A **Tool-Based Recovery Engine** — independently implemented, Spring-discoverable tools, one per recovery action
+- Two new database tables (`failure_analysis`, `recovery_decision`) capturing every AI decision for auditability
+
+---
+
+## AI Recovery Architecture
 
 ```
-notification-system/                          ← Parent Maven project
-├── pom.xml                                   ← Parent pom (Java 21, Spring Boot 3.5.x)
-│
-├── order-service/                            ← Port 8082
-│   └── src/main/java/com/mahesh/
-│       ├── OrderServiceApplication.java
-│       └── orderservice/
-│           ├── controller/
-│           │   └── OrderController.java       ← POST /order/v1/create
-│           ├── service/impl/
-│           │   └── OrderServiceImpl.java
-│           ├── kafka/
-│           │   ├── OrderEventPublisherService.java  ← Publishes to order-event-topic
-│           │   ├── KafkaTopicConfig.java             ← Creates order-event-topic (3 partitions)
-│           │   └── kafkaConfig.java
-│           ├── model/
-│           │   └── Order.java                 ← Table: orders
-│           ├── filter/
-│           │   └── MdcFilter.java             ← UUID in every log line
-│           ├── dto/request/OrderRequest.java
-│           ├── dto/response/OrderResponse.java
-│           └── vo/OrderVo.java
-│
-├── notification-service/                     ← Port 8083
-│   └── src/main/java/com/mahesh/
-│       ├── NotificationServiceApplication.java
-│       └── notificationservice/
-│           ├── kafka/
-│           │   ├── OrderEventNotificationConsumer.java ← Consumes order-event-topic
-│           │   ├── DLQConsumer.java                    ← Consumes notification-dlq
-│           │   └── KafkaTopicConfig.java               ← Creates notification-dlq topic
-│           ├── service/impl/
-│           │   ├── NotificationServiceImpl.java        ← Core orchestrator
-│           │   ├── RetryServiceImpl.java               ← Retry + DLQ logic
-│           │   └── TemplateServiceImpl.java            ← Builds email content
-│           ├── channel/
-│           │   └── EmailDispacher.java                 ← Gmail SMTP dispatcher
-│           ├── redis/
-│           │   └── IdempotencyService.java             ← Redis duplicate check
-│           ├── model/
-│           │   ├── NotificationDetails.java    ← Table: notification_details
-│           │   ├── NotificationPreferences.java ← Table: notification_preferences
-│           │   └── NotificationTemplate.java   ← Table: notification_template
-│           ├── config/
-│           │   ├── MailConfig.java
-│           │   └── redisConfig.java
-│           └── dto/
-│               ├── EventRequest.java
-│               └── DLQMessage.java
-│
-└── notification-management-api/             ← Port 8084
-    └── src/main/java/com/mahesh/
-        ├── ManagementApiApplication.java
-        └── managementapi/
-            ├── contoller/
-            │   ├── DLQContoller.java                  ← DLQ endpoints
-            │   ├── NotificationPreferencesController.java
-            │   ├── NotificationTemplateController.java
-            │   └── OrderStatusController.java
-            ├── service/impl/
-            │   ├── DLQRetryServiceImpl.java           ← Clears Redis + re-queues to Kafka
-            │   ├── DLQServiceImpl.java                ← Fetches DLQ records
-            │   ├── OrderStatusServiceImpl.java        ← Changes order status + publishes event
-            │   ├── PreferencesServiceImpl.java
-            │   └── TemplateServiceImpl.java
-            ├── model/
-            │   ├── NotificationDetails.java
-            │   ├── NotificationPreferences.java
-            │   └── NotificationTemplate.java
-            ├── filter/
-            │   └── MdcFilter.java
-            └── vo/
-                ├── EventRequestVo.java
-                └── OrderVo.java
+                     ┌─────────────────────────────────────────────────┐
+                     │         notification-dlq  (Kafka topic)           │
+                     └────────────────────────┬───────────────────────────┘
+                                                │
+                                                ▼
+                     ┌─────────────────────────────────────────────────┐
+                     │             AI Failure Analysis Agent              │
+                     │                    (Gemini)                        │
+                     │  Notification + Retry Count + Error + Channel      │
+                     │      → Incident Summary / Root Cause / Severity /  │
+                     │        Retry Recommended / Suggested Fix /         │
+                     │        Confidence                                  │
+                     │             → stored in failure_analysis           │
+                     └────────────────────────┬───────────────────────────┘
+                                                ▼
+                     ┌─────────────────────────────────────────────────┐
+                     │            AI Recovery Decision Agent              │
+                     │                    (Gemini)                        │
+                     │  Notification + Failure Analysis                   │
+                     │      → RecoveryAction / RetryAfterMinutes /        │
+                     │        Reason / Confidence                         │
+                     │             → stored in recovery_decision          │
+                     └────────────────────────┬───────────────────────────┘
+                                                ▼
+                     ┌─────────────────────────────────────────────────┐
+                     │     Recovery Scheduler  (runs every minute)        │
+                     │       loads pending, due recovery decisions        │
+                     └────────────────────────┬───────────────────────────┘
+                                                ▼
+                     ┌─────────────────────────────────────────────────┐
+                     │                  Recovery Agent                    │
+                     │            (reads decision, picks a tool)          │
+                     └────────────────────────┬───────────────────────────┘
+                                                ▼
+                     ┌─────────────────────────────────────────────────┐
+                     │                   Tool Factory                     │
+                     ├───────────┬───────────┬───────────┬───────────────┤
+                     │Retry Tool │Escalation │Manual Rev.│ Discard Tool   │
+                     │           │Tool       │Tool       │                │
+                     └───────────┴───────────┴───────────┴───────────────┘
 ```
 
 ---
 
-## Key Features
+## Spring AI Integration
 
-### 1. Event-Driven Architecture
-Order Service publishes `OrderVo` to Kafka topic `order-event-topic` using `userId` as the partition key — ensuring all events for the same user go to the same partition and are processed in order.
+The AI layer is built entirely on **Spring AI**, using:
 
-### 2. MDC Filter (Request Tracing)
-Every request generates a UUID stored in MDC. All log lines across the request lifecycle carry this UUID, making it easy to trace a complete request flow.
+- Google GenAI Starter (`spring-ai-google-genai-spring-boot-starter`)
+- **Gemini Flash** as the underlying model — chosen for low latency and cost, since analysis runs on every DLQ event
+- Prompt templates for consistent, structured prompting
+- Structured JSON output via `BeanOutputConverter`, so Gemini's response deserializes directly into typed Java records/DTOs
+- `ChatClient` as the single entry point used by both AI agents
 
-### 3. Redis Idempotency Check
-Before processing any event, `IdempotencyService` checks Redis:
-```
-Key pattern : idempotency:{orderId}:{orderStatus}
-Value       : "Processed"
-TTL         : 24 hours
-```
-Duplicate Kafka messages are detected and skipped automatically.
-
-### 4. User Preference Based Routing
-`NotificationServiceImpl` fetches user preferences from `notification_preferences` table. Supports `EMAIL`, `SMS`, and `BOTH` channels. Defaults to EMAIL if no preference found.
-
-### 5. Template Engine
-Notification content stored in `notification_template` table with placeholders:
-```
-"Hi User {{userId}}, your order {{orderId}} has been placed. Amount: ₹{{amount}}"
-→ "Hi User 101, your order ORD-001 has been placed. Amount: ₹1299.0"
-```
-Supported placeholders: `{{orderId}}`, `{{userId}}`, `{{amount}}`, `{{items}}`, `{{status}}`
-
-### 6. Retry with Exponential Backoff
-Failed notifications are retried 3 times with increasing delays:
-```
-Attempt 1 → wait 2 seconds  → retry
-Attempt 2 → wait 4 seconds  → retry
-Attempt 3 → wait 8 seconds  → retry
-All failed → push to notification-dlq
-```
-
-### 7. Dead Letter Queue (DLQ)
-Messages that fail all retries are published to `notification-dlq` topic. `DLQConsumer` saves the failure with status `DLQ` to `notification_details` table. Admin retries via `POST /dlq/api/v1/retry/{orderId}`.
-
-### 8. DLQ Retry — Edge Case Handled
-When retrying a DLQ record, `DLQRetryServiceImpl`:
-1. Reads original event from `payload` column
-2. **Deletes Redis idempotency key** — prevents skip due to duplicate detection
-3. Re-publishes original event to `order-event-topic`
-4. `NotificationServiceImpl` reuses existing DB entry instead of creating duplicate
-
-### 9. Order Status Change
-`OrderStatusController` allows changing order status and re-publishing event to Kafka — simulating real-world status updates (ORDER_CONFIRMED, ORDER_SHIPPED etc.) without needing separate microservices.
+Because the output is coerced into a typed Java object at the boundary, none of the downstream components (scheduler, recovery agent, tools) need to know they're dealing with an LLM at all — from their point of view, it's just another service call that returns a POJO.
 
 ---
 
-## Database Schema
+## AI Failure Analysis Agent
 
-```sql
--- Stores every order
-CREATE TABLE orders (
-    id           BIGINT AUTO_INCREMENT PRIMARY KEY,
-    order_id     VARCHAR(255),
-    user_id      VARCHAR(255),
-    items        VARCHAR(255),
-    amount       DOUBLE,
-    order_status VARCHAR(255),
-    created_at   DATETIME,
-    updated_at   DATETIME
-);
+Triggered the moment a notification reaches the DLQ.
 
--- Stores every notification attempt
-CREATE TABLE notification_details (
-    id                    BIGINT AUTO_INCREMENT PRIMARY KEY,
-    order_id              VARCHAR(255),
-    user_id               VARCHAR(255),
-    notification_type     VARCHAR(255),
-    notification_status   VARCHAR(255),
-    channel               VARCHAR(255),
-    error_message         TEXT,
-    retry_count           INT,
-    payload               TEXT,
-    created_at            DATETIME,
-    updated_at            DATETIME
-);
+**Flow:**
 
--- User channel preferences per notification type
-CREATE TABLE notification_preferences (
-    id                BIGINT AUTO_INCREMENT PRIMARY KEY,
-    user_id           VARCHAR(255),
-    notification_type VARCHAR(255),
-    channel           VARCHAR(255),
-    is_enable         BOOLEAN
-);
+1. A notification reaches the DLQ.
+2. `FailureAnalysisService` is invoked.
+3. Gemini receives:
+   - Notification details
+   - Retry count
+   - Error message
+   - Notification channel
+   - Current status
+4. Gemini returns a structured JSON object containing:
+   - **Incident Summary**
+   - **Root Cause**
+   - **Severity**
+   - **Retry Recommended** (boolean)
+   - **Suggested Fix**
+   - **Confidence**
+5. The response is persisted in the `failure_analysis` table.
 
--- Email templates with placeholders
-CREATE TABLE notification_template (
-    id                BIGINT AUTO_INCREMENT PRIMARY KEY,
-    notification_type VARCHAR(255),
-    channel           VARCHAR(255),
-    subject           VARCHAR(255),
-    body_template     TEXT
-);
+```java
+public record FailureAnalysisResult(
+    String incidentSummary,
+    String rootCause,
+    String severity,
+    boolean retryRecommended,
+    String suggestedFix,
+    double confidence
+) {}
 ```
 
 ---
 
-## Notification Types
+## AI Recovery Decision Agent
 
-| Type | Trigger |
-|---|---|
-| `ORDER_CREATED` | New order placed |
-| `ORDER_CONFIRMED` | Order confirmed |
-| `ORDER_SHIPPED` | Order shipped |
-| `ORDER_DELIVERED` | Order delivered |
-| `PAYMENT_SUCCESS` | Payment received |
-| `PAYMENT_FAILED` | Payment failed |
+Once a failure has been analyzed, a second, independent agent decides what to actually *do* about it.
+
+**Flow:**
+
+1. `RecoveryDecisionService` reads:
+   - The notification record
+   - The corresponding failure analysis
+2. Gemini decides on:
+   - **RecoveryAction** — one of `RETRY_NOW`, `RETRY_LATER`, `ESCALATE`, `MANUAL_REVIEW`, `DISCARD`
+   - **RetryAfterMinutes** (when applicable)
+   - **Reason**
+   - **Confidence**
+3. The decision is persisted in the `recovery_decision` table.
+
+```java
+public record RecoveryDecision(
+    RecoveryAction action,
+    Integer retryAfterMinutes,
+    String reason,
+    double confidence
+) {}
+```
+
+Separating *analysis* from *decision* into two distinct agent calls keeps each prompt focused and each response easier to validate — the failure analysis agent never has to reason about scheduling or business policy, and the decision agent never has to re-derive the root cause.
 
 ---
 
-## Kafka Topics
+## Recovery Scheduler
 
-| Topic | Partitions | Producer | Consumer |
-|---|---|---|---|
-| `order-event-topic` | 3 | `OrderEventPublisherService` | `OrderEventNotificationConsumer` |
-| `notification-dlq` | 3 | `RetryServiceImpl` | `DLQConsumer` |
+A `@Scheduled` job that runs **every minute**:
+
+1. Loads all pending recovery decisions whose scheduled time has arrived.
+2. Invokes the **Recovery Agent** for each one.
+
+This decouples "when the AI decided" from "when the recovery actually executes," which matters most for `RETRY_LATER` decisions with a delay attached.
 
 ---
 
-## API Reference
+## Recovery Agent
 
-### Order Service — Port 8082
+The Recovery Agent is deliberately "dumb" — it contains **no business logic** of its own. Its only two jobs:
 
-| Method | Endpoint | Description |
-|---|---|---|
-| POST | `/order/v1/create` | Create order and publish Kafka event |
+1. Read the AI's decision.
+2. Delegate execution to the correct tool.
 
-**Request:**
-```json
-{
-    "userId": "USR-101",
-    "items": "iPhone Case, Cable",
-    "amount": 1299.00
+```
+Recovery Agent
+      │
+      ▼
+ Reads RecoveryDecision
+      │
+      ▼
+ Asks ToolFactory for the matching RecoveryTool
+      │
+      ▼
+ Delegates execution to that tool
+```
+
+All actual recovery behavior — retrying, escalating, flagging for manual review, discarding — lives inside independently testable tool classes, not inside the agent.
+
+---
+
+## Tool-Based Architecture
+
+```
+Recovery Agent
+      │
+      ▼
+ Tool Factory
+      │
+      ├──► Retry Tool
+      ├──► Escalation Tool
+      ├──► Manual Review Tool
+      └──► Discard Tool
+```
+
+Every tool implements a common contract:
+
+```java
+public interface RecoveryTool {
+    RecoveryAction getAction();
+    void execute(Notification notification, RecoveryDecision decision);
 }
 ```
 
-**Response:**
-```json
-{
-    "statusCode": "200",
-    "statusMessage": "Success",
-    "requestUUID": "uuid-here",
-    "data": {
-        "orderId": "ORD-001",
-        "userId": "USR-101",
-        "items": "iPhone Case, Cable",
-        "amount": 1299.00,
-        "orderStatus": "ORDER_CREATED",
-        "createdAt": "2026-05-28T10:00:00",
-        "updatedAt": "2026-05-28T10:00:00"
+- `ToolFactory` auto-discovers every `RecoveryTool` bean via Spring dependency injection — no manual registration.
+- The Recovery Agent picks a tool dynamically by matching `RecoveryDecision.action()` against each tool's `getAction()`.
+- There is **no switch-case** inside the agent; adding a new recovery action means adding a new `RecoveryTool` implementation, nothing else.
+
+```java
+@Component
+public class ToolFactory {
+
+    private final Map<RecoveryAction, RecoveryTool> toolMap;
+
+    public ToolFactory(List<RecoveryTool> tools) {
+        this.toolMap = tools.stream()
+            .collect(Collectors.toMap(RecoveryTool::getAction, Function.identity()));
+    }
+
+    public RecoveryTool getTool(RecoveryAction action) {
+        return toolMap.get(action);
     }
 }
 ```
 
 ---
 
-### Notification Management API — Port 8084
+## Design Patterns Used
 
-#### DLQ Endpoints
-
-| Method | Endpoint | Description |
-|---|---|---|
-| GET | `/dlq/api/v1/records` | Get all DLQ failed notifications |
-| POST | `/dlq/api/v1/retry/{orderId}` | Retry failed notification by orderId |
-
-**Retry Response:**
-```json
-{
-    "statusCode": "200",
-    "message": "Retry triggered successfully for orderId : ORD-001",
-    "requestUUID": "uuid-here",
-    "errorMessage": null
-}
-```
-
----
-
-#### Preference Endpoints
-
-| Method | Endpoint | Description |
-|---|---|---|
-| POST | `/preferences/api/v1/add` | Add user notification preference |
-| GET | `/preferences/api/v1/get/{userId}` | Get preferences for a user |
-
-**Add Preference Request:**
-```json
-{
-    "userId": "USR-101",
-    "notificationType": "ORDER_CREATED",
-    "channel": "EMAIL",
-    "isEnable": true
-}
-```
-
----
-
-#### Template Endpoints
-
-| Method | Endpoint | Description |
-|---|---|---|
-| POST | `/template/api/v1/register` | Register a notification template |
-| POST | `/template/api/v1/get` | Get a template by type and channel |
-
-**Register Template Request:**
-```json
-{
-    "notificationType": "ORDER_CREATED",
-    "channel": "EMAIL",
-    "subject": "🎉 Order Confirmed - Order #{{orderId}}",
-    "bodyTemplate": "Hi User {{userId}},\n\nYour order {{orderId}} has been placed.\nItems: {{items}}\nAmount: ₹{{amount}}\n\nTeam Notification System"
-}
-```
-
----
-
-#### Order Status Endpoint
-
-| Method | Endpoint | Description |
-|---|---|---|
-| POST | `/order/api/v1/status` | Change order status and re-publish event |
-
-**Request:**
-```json
-{
-    "orderId": "ORD-001",
-    "newStatus": "ORDER_SHIPPED"
-}
-```
-
-**Response:**
-```json
-{
-    "statusCode": "200",
-    "message": "Status changed for orderId :ORD-001",
-    "requestUUID": "uuid-here",
-    "orderDetails": {
-        "orderId": "ORD-001",
-        "oldStatus": "ORDER_CREATED",
-        "newStatus": "ORDER_SHIPPED",
-        "createdAt": "2026-05-28T10:00:00"
-    }
-}
-```
-
----
-
-## Complete Notification Flow
-
-```
-1.  Client hits POST /order/v1/create
-2.  OrderServiceImpl saves order to orders table
-3.  OrderEventPublisherService publishes OrderVo to order-event-topic
-    (userId used as Kafka partition key)
-4.  OrderEventNotificationConsumer picks up event
-5.  IdempotencyService checks Redis:
-    key = idempotency:{orderId}:{orderStatus}
-    → EXISTS: skip (duplicate) 
-    → NOT EXISTS: continue
-6.  NotificationServiceImpl.processForNotification() called
-7.  Fetch NotificationPreferences for userId from DB
-    → No preference found: default to EMAIL
-    → Preference found: use configured channel
-8.  TemplateServiceImpl fetches template from notification_template
-9.  Placeholders replaced: {{orderId}}, {{userId}}, {{amount}}, {{items}}
-10. EmailDispacher sends email via Gmail SMTP
-11. NotificationDetails saved to notification_details table (status=SENT)
-12. IdempotencyService marks event as processed in Redis (TTL: 24 hours)
-
---- ON FAILURE ---
-11. NotificationDetails saved (status=FAILED)
-12. RetryServiceImpl.handleFailure() called
-13. Retry 1: wait 2s → sendMail() → success: status=SENT, return
-14. Retry 2: wait 4s → sendMail() → success: status=SENT, return
-15. Retry 3: wait 8s → sendMail() → success: status=SENT, return
-16. All retries failed → sendToDLQ()
-17. DLQMessage published to notification-dlq topic
-18. DLQConsumer receives it → saves status=DLQ to notification_details
-
---- DLQ RETRY ---
-19. Admin hits POST /dlq/api/v1/retry/{orderId}
-20. DLQRetryServiceImpl reads payload from notification_details
-21. Deletes Redis key: idempotency:{orderId}:{orderStatus}
-22. Re-publishes original event to order-event-topic
-23. Flow repeats from step 4
-```
-
----
-
-## Edge Cases Handled
-
-| Edge Case | Solution |
+| Pattern | Where it's applied |
 |---|---|
-| Duplicate Kafka message delivery | Redis idempotency check — skips if already processed |
-| Email server temporarily down | Exponential backoff retry (2s → 4s → 8s) |
-| All retries exhausted | Dead Letter Queue — message preserved for manual retry |
-| DLQ retry blocked by Redis | Redis key deleted before re-publishing in DLQRetryServiceImpl |
-| DLQ retry creates duplicate DB row | `findByOrderId` reuses existing entry — resets status to PENDING |
-| Request tracing across logs | MDC UUID filter on every request in all 3 services |
+| **Strategy Pattern** | Each `RecoveryTool` is an interchangeable strategy for handling a `RecoveryAction` |
+| **Factory Pattern** | `ToolFactory` resolves the correct tool at runtime |
+| **Open/Closed Principle** | New recovery actions are added without modifying the Recovery Agent |
+| **Dependency Injection** | Tools are auto-wired and auto-discovered by Spring |
+| **Tool Pattern** | AI decisions are translated into discrete, executable capabilities |
+| **Event-Driven Architecture** | Kafka decouples the base notification pipeline from the AI recovery pipeline |
 
 ---
+
+## Database Schema (AI Tables)
+
+The base platform's tables (`orders`, `notification_details`, `notification_preferences`, `notification_template`) are unchanged and documented elsewhere. This extension adds two new tables:
+
+### `failure_analysis`
+Output of the AI Failure Analysis Agent, one row per DLQ event.
+
+| Column | Type | Notes |
+|---|---|---|
+| id | BIGINT (PK) | |
+| notification_id | BIGINT (FK) | |
+| incident_summary | TEXT | |
+| root_cause | TEXT | |
+| severity | VARCHAR | |
+| retry_recommended | BOOLEAN | |
+| suggested_fix | TEXT | |
+| confidence | DOUBLE | |
+| created_at | TIMESTAMP | |
+
+### `recovery_decision`
+Output of the AI Recovery Decision Agent, and the input the scheduler consumes.
+
+| Column | Type | Notes |
+|---|---|---|
+| id | BIGINT (PK) | |
+| notification_id | BIGINT (FK) | |
+| action | VARCHAR | `RETRY_NOW` / `RETRY_LATER` / `ESCALATE` / `MANUAL_REVIEW` / `DISCARD` |
+| retry_after_minutes | INT | Nullable |
+| reason | TEXT | |
+| confidence | DOUBLE | |
+| executed | BOOLEAN | Set once the Recovery Agent has processed it |
+| created_at | TIMESTAMP | |
+
+---
+
+## Project Structure (AI Modules)
+
+Only the new packages inside `notification-service` are shown below; the rest of the module layout (base controllers, entities, Kafka consumers) is unchanged.
+
+```
+notification-service/
+└── src/main/java/com/mahesh/notificationservice/
+    ├── ai/
+    │   ├── config/
+    │   │   └── AiConfig.java
+    │   ├── controller/
+    │   │   └── AiTestController.java
+    │   ├── dto/
+    │   │   ├── FailureAnalysisResponse.java
+    │   │   └── RecoveryDecisionResponse.java
+    │   ├── enums/
+    │   │   ├── RecoveryAction.java
+    │   │   └── Severity.java
+    │   ├── model/
+    │   │   ├── FailureAnalysisEntity.java
+    │   │   └── RecoveryDecisionEntity.java
+    │   ├── repository/
+    │   │   ├── FailureAnalysisRepository.java
+    │   │   └── RecoveryDecisionRepository.java
+    │   ├── scheduler/
+    │   │   └── RecoveryScheduler.java
+    │   ├── service/
+    │   │   ├── impl/
+    │   │   │   ├── FailureAnalysisServiceImpl.java
+    │   │   │   ├── RecoveryAgentImpl.java
+    │   │   │   └── RecoveryDecisionServiceImpl.java
+    │   │   ├── FailureAnalysisService.java
+    │   │   ├── RecoveryAgent.java
+    │   │   └── RecoveryDecisionService.java
+    │   ├── tool/
+    │   │   ├── DiscardTool.java
+    │   │   ├── EscalationTool.java
+    │   │   ├── ManualReviewTool.java
+    │   │   ├── RecoveryTool.java
+    │   │   ├── RetryTool.java
+    │   │   └── ToolFactory.java
+    │   └── util/
+    ├── channel/
+    ├── config/
+    ├── dto/
+    ├── kafka/
+    ├── model/
+    ├── redis/
+    ├── repository/
+    ├── service/
+    └── NotificationServiceApplication.java
+
+src/main/resources/
+├── prompts/
+│   ├── failure-analysis.st
+│   └── recovery-decision.st
+├── application.yml
+├── application-dev.yml
+└── logback-spring.xml
+```
+
 
 ## Local Setup
 
 ### Prerequisites
 
 - Java 21
-- Maven 3.8+
-- MySQL 8.0 (local install, port 3306)
-- Apache Kafka 3.x (local install)
-- Redis (local install, port 6379)
+- Maven 3.9+
+- MySQL 8+
+- Redis 7+
+- Apache Kafka (with Zookeeper or KRaft)
+- A Google Gemini API key
 
-### Step 1 — Create Database
-
-```sql
-CREATE DATABASE notification_db;
-```
-
-### Step 2 — Start Zookeeper
-
-Open Terminal 1:
-```bash
-cd C:\kafka
-bin\windows\zookeeper-server-start.bat config\zookeeper.properties
-```
-
-Wait for:
-```
-binding to port 0.0.0.0/0.0.0.0:2181
-```
-
-### Step 3 — Start Kafka
-
-Open Terminal 2:
-```bash
-cd C:\kafka
-bin\windows\kafka-server-start.bat config\server.properties
-```
-
-Wait for:
-```
-[KafkaServer id=0] started
-```
-
-### Step 4 — Start Redis
+### Environment Variables
 
 ```bash
-redis-server
+export DB_URL=jdbc:mysql://localhost:3306/notification_platform
+export DB_USERNAME=root
+export DB_PASSWORD=yourpassword
+export REDIS_HOST=localhost
+export REDIS_PORT=6379
+export KAFKA_BOOTSTRAP_SERVERS=localhost:9092
+export GEMINI_API_KEY=your_google_gemini_api_key
 ```
 
-Verify:
-```bash
-redis-cli ping
-# → PONG
-```
-
-### Step 5 — Configure Credentials
-
-Update `application-dev.yml` in each service:
-
-```yaml
-spring:
-  datasource:
-    username: your_mysql_username
-    password: your_mysql_password
-  mail:
-    username: your_gmail@gmail.com
-    password: your_16char_app_password
-```
-
-> **Gmail App Password:** Go to myaccount.google.com → Security → 2-Step Verification → App Passwords → Generate
-
-### Step 6 — Run Services
+### Steps
 
 ```bash
-# Terminal 1 - Order Service (port 8082)
-cd order-service
-mvn spring-boot:run
+# 1. Clone the repository
+git clone https://github.com/your-username/ai-notification-recovery-platform.git
+cd ai-notification-recovery-platform
 
-# Terminal 2 - Notification Service (port 8083)
-cd notification-service
-mvn spring-boot:run
+# 2. Start infrastructure (MySQL, Redis, Kafka)
+docker-compose up -d
 
-# Terminal 3 - Management API (port 8084)
-cd notification-management-api
-mvn spring-boot:run
+# 3. Build all modules
+mvn clean install
+
+# 4. Run each service
+cd order-service && mvn spring-boot:run
+cd ../notification-service && mvn spring-boot:run
+cd ../notification-management-api && mvn spring-boot:run
+```
+
+Services will be available at:
+
+- Order Service → `http://localhost:8082`
+- Notification Service → `http://localhost:8083`
+- Notification Management API → `http://localhost:8084`
+
+---
+
+## Testing Guide
+
+- **Unit tests** — each `RecoveryTool` implementation is tested in isolation with mocked notification/decision inputs.
+- **Service tests** — `FailureAnalysisService` and `RecoveryDecisionService` are tested with a mocked `ChatClient`, so the AI prompt/response contract can be verified without calling Gemini.
+- **Integration tests** — the DLQ → analysis → decision → scheduler → agent → tool chain is tested end-to-end with an embedded Kafka broker.
+- **End-to-end** — a full run from a forced failure through DLQ, AI analysis, AI decision, and tool execution, asserting on the final notification status.
+
+```bash
+mvn test                     # unit tests
+mvn verify -Pintegration     # integration tests
 ```
 
 ---
 
-## Quick Test Guide
+## Edge Cases Handled
 
-### 1. Register Template
-```bash
-POST http://localhost:8084/template/api/v1/register
-{
-    "notificationType": "ORDER_CREATED",
-    "channel": "EMAIL",
-    "subject": "🎉 Order Confirmed - Order #{{orderId}}",
-    "bodyTemplate": "Hi User {{userId}}, your order {{orderId}} has been placed. Items: {{items}}. Amount: ₹{{amount}}"
-}
-```
-
-### 2. Add User Preference
-```bash
-POST http://localhost:8084/preferences/api/v1/add
-{
-    "userId": "USR-101",
-    "notificationType": "ORDER_CREATED",
-    "channel": "EMAIL",
-    "isEnable": true
-}
-```
-
-### 3. Place Order → Triggers Email
-```bash
-POST http://localhost:8082/order/v1/create
-{
-    "userId": "USR-101",
-    "items": "iPhone Case, Cable",
-    "amount": 1299.00
-}
-```
-
-### 4. Change Order Status → Triggers Another Email
-```bash
-POST http://localhost:8084/order/api/v1/status
-{
-    "orderId": "ORD-001",
-    "newStatus": "ORDER_SHIPPED"
-}
-```
-
-### 5. View DLQ Records
-```bash
-GET http://localhost:8084/dlq/api/v1/records
-```
-
-### 6. Retry Failed Notification
-```bash
-POST http://localhost:8084/dlq/api/v1/retry/ORD-001
-```
-
----
-
-## Author
-
-**Mahesh Motale**
-- GitHub: [Mahesh-Motale77](https://github.com/Mahesh-Motale77)
-- LinkedIn: [mahesh-motale-7281a7225](https://www.linkedin.com/in/mahesh-motale-7281a7225/)
+- **AI unavailability** — failure analysis and recovery decision calls are wrapped so a Gemini outage doesn't block the DLQ consumer; affected notifications remain queryable for manual handling.
+- **Low-confidence AI decisions** — decisions below a confidence threshold are routed toward `MANUAL_REVIEW` rather than being auto-executed.
+- **Scheduler overlap** — the Recovery Scheduler only picks up decisions that are both pending and due, preventing double execution.
+- **Autonomous retry loops** — a recovered notification that fails again is treated as a new failure event with its own analysis, rather than replaying the previous one.
