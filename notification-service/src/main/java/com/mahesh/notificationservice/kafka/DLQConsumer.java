@@ -2,6 +2,7 @@ package com.mahesh.notificationservice.kafka;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.mahesh.notificationservice.ai.service.FailureAnalysisService;
+import com.mahesh.notificationservice.ai.service.RecoveryDecisionService;
 import com.mahesh.notificationservice.dto.DLQMessage;
 import com.mahesh.notificationservice.model.NotificationDetails;
 import com.mahesh.notificationservice.repository.NotificationDetailsRepository;
@@ -23,6 +24,7 @@ public class DLQConsumer {
     private final ObjectMapper objectMapper;
     private final NotificationDetailsRepository notificationDetailsRepository;
     private final FailureAnalysisService failureAnalysisService;
+    private final RecoveryDecisionService recoveryDecisionService;
 
     @KafkaListener(topics = "notification-dlq", groupId = "dlq-consumer-group")
     public void consumeDLQ(String message) {
@@ -53,6 +55,8 @@ public class DLQConsumer {
                     });
 
             notificationDetails.ifPresent(failureAnalysisService::analyze);
+
+            notificationDetails.ifPresent(recoveryDecisionService::decide);
 
         } catch (Exception e) {
             log.error("Failed to process DLQ message: {}", e.getMessage());
