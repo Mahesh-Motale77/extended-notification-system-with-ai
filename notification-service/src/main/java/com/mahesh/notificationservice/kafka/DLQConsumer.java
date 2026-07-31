@@ -1,6 +1,7 @@
 package com.mahesh.notificationservice.kafka;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.mahesh.notificationservice.ai.service.FailureAnalysisService;
 import com.mahesh.notificationservice.dto.DLQMessage;
 import com.mahesh.notificationservice.model.NotificationDetails;
 import com.mahesh.notificationservice.repository.NotificationDetailsRepository;
@@ -11,6 +12,7 @@ import org.springframework.kafka.annotation.KafkaListener;
 import org.springframework.stereotype.Component;
 
 import java.time.LocalDateTime;
+import java.util.Optional;
 import java.util.UUID;
 
 @Component
@@ -20,6 +22,7 @@ public class DLQConsumer {
 
     private final ObjectMapper objectMapper;
     private final NotificationDetailsRepository notificationDetailsRepository;
+    private final FailureAnalysisService failureAnalysisService;
 
     @KafkaListener(topics = "notification-dlq", groupId = "dlq-consumer-group")
     public void consumeDLQ(String message) {
@@ -37,7 +40,9 @@ public class DLQConsumer {
             );
 
             // Update notification log status to DLQ
-            notificationDetailsRepository.findByOrderId(dlqMessage.getOrderId())
+            Optional<NotificationDetails> notificationDetails = notificationDetailsRepository.findByOrderId(dlqMessage.getOrderId());
+
+            notificationDetails
                     .ifPresent(existingNotificationDetails -> {
                         existingNotificationDetails.setNotificationStatus(NotificationDetails.NotificationStatus.DLQ);
                         existingNotificationDetails.setErrorMessage(dlqMessage.getErrorMessage());
@@ -46,6 +51,8 @@ public class DLQConsumer {
 
                         log.info("DLQ record saved | orderId : {}", dlqMessage.getOrderId());
                     });
+
+            notificationDetails.ifPresent(failureAnalysisService::analyze);
 
         } catch (Exception e) {
             log.error("Failed to process DLQ message: {}", e.getMessage());
