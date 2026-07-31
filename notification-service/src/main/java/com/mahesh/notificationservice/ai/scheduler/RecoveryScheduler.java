@@ -2,13 +2,12 @@ package com.mahesh.notificationservice.ai.scheduler;
 
 import com.mahesh.notificationservice.ai.model.RecoveryDecisionEntity;
 import com.mahesh.notificationservice.ai.repository.RecoveryDecisionRepository;
-import com.mahesh.notificationservice.ai.service.RecoveryExecutorService;
+import com.mahesh.notificationservice.ai.service.RecoveryAgent;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
 
-import java.time.LocalDateTime;
 import java.util.List;
 
 @Slf4j
@@ -17,16 +16,16 @@ import java.util.List;
 public class RecoveryScheduler {
 
     private final RecoveryDecisionRepository repository;
-    private final RecoveryExecutorService recoveryExecutorService;
+    private final RecoveryAgent recoveryAgent;
 
     @Scheduled(fixedRate = 600000)
     public void executeRecovery() {
 
         List<RecoveryDecisionEntity> pendingRecoveries =
-                repository.findByStatus(
+                repository.findByStatusWithNotification(
                         RecoveryDecisionEntity.Status.PENDING
                 );
 
-        pendingRecoveries.forEach(recoveryExecutorService::execute);
+        pendingRecoveries.forEach(recoveryAgent::execute);
     }
 }
