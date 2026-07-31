@@ -41,7 +41,7 @@ public class EmailDispacher {
         log.info("Email Sent for userId {} | orderId : {} | orderStatus : {}", eventRequest.getUserId(),
                 eventRequest.getOrderId(), eventRequest.getOrderStatus());
 
-//      throw new RuntimeException("Simulated email failure for testing DLQ");
+      throw new RuntimeException("Simulated email failure for testing DLQ");
 
     }
 

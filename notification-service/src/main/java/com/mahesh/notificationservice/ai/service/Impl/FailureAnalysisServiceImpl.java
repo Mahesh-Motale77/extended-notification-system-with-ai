@@ -25,7 +25,7 @@ public class FailureAnalysisServiceImpl implements FailureAnalysisService {
     private final ChatClient chatClient;
     private final FailureAnalysisRepository failureAnalysisRepository;
 
-    @Value("src/main/java/com/mahesh/notificationservice/ai/prompt/failure-analysis.st")
+    @Value("classpath:prompts/failure-analysis.st")
     private Resource promptResource;
 
     @Override
